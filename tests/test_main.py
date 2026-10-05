@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 spec = importlib.util.spec_from_file_location("main", os.path.join(ROOT, "main.py"))
@@ -61,8 +62,58 @@ class ReminderTest(unittest.TestCase):
         message = main.build_message(main.DEFAULT_MESSAGE, 7)
         self.assertEqual(
             message,
-            "🧦 Dag 7 van te commenten tot ik gratis sokken krijg van nws.nws.nws. op TikTok",
+            "@everyone 🧦 Dag 7 van te commenten tot ik gratis sokken krijg "
+            "van nws.nws.nws. op TikTok",
         )
+
+    def test_mention_defaults_to_everyone_and_can_be_turned_off(self):
+        # unset -> @everyone, empty/none/off -> no ping, anything else -> itself
+        self.assertEqual(main.resolve_mention(None), "@everyone")
+        self.assertEqual(main.resolve_mention("none"), None)
+        self.assertEqual(main.resolve_mention(" off "), None)
+        self.assertEqual(main.resolve_mention(""), None)
+        self.assertEqual(main.resolve_mention("@here"), "@here")
+
+        plain = "🧦 Dag 7 van te commenten tot ik gratis sokken krijg van nws.nws.nws. op TikTok"
+        self.assertEqual(main.build_message(main.DEFAULT_MESSAGE, 7, None), plain)
+        # a custom template that already pings does not get a second one
+        self.assertEqual(main.build_message("@everyone Dag {day}", 3), "@everyone Dag 3")
+        self.assertEqual(main.build_message("Dag {day}", 3, "@here"), "@here Dag 3")
+
+    def test_payload_pings_everyone(self):
+        main.post_daily_reminder(self.state_file, webhook_url=self.url)
+        body = FakeDiscord.received[0]["body"]
+        self.assertTrue(body["content"].startswith("@everyone "))
+        self.assertEqual(body["allowed_mentions"], {"parse": ["everyone"]})
+
+    def test_no_ping_when_mention_is_none(self):
+        main.post_daily_reminder(self.state_file, webhook_url=self.url, mention="none")
+        body = FakeDiscord.received[0]["body"]
+        self.assertFalse(body["content"].startswith("@everyone"))
+        self.assertEqual(body["allowed_mentions"], {"parse": []})
+
+    def test_scheduled_run_skips_when_today_already_posted(self):
+        main.post_daily_reminder(self.state_file, webhook_url=self.url)
+        self.assertEqual(len(FakeDiscord.received), 1)
+
+        # the hourly window tries again -> nothing happens, nobody gets pinged twice
+        result = main.post_daily_reminder(self.state_file, webhook_url=self.url,
+                                          skip_if_posted=True)
+        self.assertFalse(result["posted"])
+        self.assertTrue(result["skipped"])
+        self.assertEqual(len(FakeDiscord.received), 1)
+
+        # a manual run (no skip flag) still posts, e.g. after a missed day
+        again = main.post_daily_reminder(self.state_file, webhook_url=self.url)
+        self.assertTrue(again["posted"])
+        self.assertEqual(len(FakeDiscord.received), 2)
+
+    def test_cli_posts_once_and_skips_the_rest_of_the_window(self):
+        env = {"DISCORD_WEBHOOK_URL": self.url, "SKIP_IF_POSTED": "1"}
+        with mock.patch.dict(os.environ, env):
+            self.assertEqual(main.main(["--state-file", self.state_file]), 0)
+            self.assertEqual(main.main(["--state-file", self.state_file]), 0)
+        self.assertEqual(len(FakeDiscord.received), 1)  # only the first run posted
 
     def test_day_advances_once_per_day(self):
         first = main.post_daily_reminder(self.state_file, webhook_url=self.url)
@@ -122,8 +173,8 @@ class ReminderTest(unittest.TestCase):
             day_override=42,
             webhook_url=self.url,
         )
-        self.assertEqual(result["message"], "Dag 42: sokken!")
-        self.assertEqual(FakeDiscord.received[0]["body"]["content"], "Dag 42: sokken!")
+        self.assertEqual(result["message"], "@everyone Dag 42: sokken!")
+        self.assertEqual(FakeDiscord.received[0]["body"]["content"], "@everyone Dag 42: sokken!")
         self.assertFalse(os.path.exists(self.state_file))  # override -> state untouched
 
     def test_missing_webhook_url_explains_itself(self):
