@@ -2,10 +2,22 @@ name: Daily Sock Reminder
 
 on:
   schedule:
-    # 18:00 UTC = 20:00 in the Netherlands during summer time (CEST),
-    # 19:00 during winter time (CET). Change it if you want another hour:
-    # https://crontab.guru (times are always UTC).
-    - cron: "0 18 * * *"
+    # Goal: ping @everyone somewhere between 18:00 and 21:00 Brussels time,
+    # every day, whatever the season. GitHub cron is always UTC and does not
+    # follow daylight saving, so the window is chosen to stay inside 18:00-21:00
+    # both in summer (CEST = UTC+2) and in winter (CET = UTC+1):
+    #
+    #   17:00 UTC -> 19:00 CEST / 18:00 CET   in the window
+    #   18:00 UTC -> 20:00 CEST / 19:00 CET   in the window
+    #   19:00 UTC -> 21:00 CEST / 20:00 CET   in the window
+    #   16:00 UTC -> 18:00 CEST / 17:00 CET   ok in summer, too early in winter
+    #   20:00 UTC -> 22:00 CEST / 21:00 CET   too late in summer
+    #
+    # GitHub may delay or skip a scheduled run when it is busy, so the job
+    # simply tries every hour of the window: the first run that gets through
+    # posts, the rest stop immediately without a second ping (SKIP_IF_POSTED).
+    # Net effect: exactly one reminder per day, between 18:00 and 21:00.
+    - cron: "0 17-19 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -36,12 +48,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: What time is it?
+        run: |
+          echo "Run started at $(date -u '+%F %T %Z') = $(TZ=Europe/Brussels date '+%F %T %Z') in Brussels"
+
       - name: Send the Discord reminder
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          # Scheduled runs are the hourly attempts in the 18:00-21:00 window:
+          # if today's reminder is already out, do nothing (and don't ping again).
+          # A manual run (Run workflow) always posts, even on a day that had one.
+          SKIP_IF_POSTED: ${{ github.event_name == 'schedule' && '1' || '' }}
           # Optional: set these under Settings -> Secrets and variables -> Actions -> Variables.
           MESSAGE_TEMPLATE: ${{ vars.MESSAGE_TEMPLATE }}
+          # An unset variable arrives as an empty string, which would read as
+          # "no ping" — so fall back to @everyone explicitly. Set the MENTION
+          # variable to "none" if the reminder should not ping anyone.
+          MENTION: ${{ vars.MENTION || '@everyone' }}
           WEBHOOK_USERNAME: ${{ vars.WEBHOOK_USERNAME }}
           TIMEZONE: ${{ vars.TIMEZONE }}
         run: python3 main.py
@@ -56,7 +80,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add state.json
           if git diff --cached --quiet; then
-            echo "state.json did not change (already posted today)."
+            echo "state.json did not change (nothing was posted, or already posted today)."
             exit 0
           fi
           git commit -m "chore: advance sock reminder day counter [skip ci]"
