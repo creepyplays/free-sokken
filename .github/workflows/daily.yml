@@ -1,0 +1,73 @@
+name: Daily Sock Reminder
+
+on:
+  schedule:
+    # 18:00 UTC = 20:00 in the Netherlands during summer time (CEST),
+    # 19:00 during winter time (CET). Change it if you want another hour:
+    # https://crontab.guru (times are always UTC).
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Test run: only print the message, post nothing, keep the day counter as is"
+        type: boolean
+        default: false
+
+# Needed to commit the updated state.json back to the repository.
+permissions:
+  contents: write
+
+# Never let two reminders overlap, so the day counter can't be updated twice.
+concurrency:
+  group: daily-sock-reminder
+  cancel-in-progress: false
+
+jobs:
+  remind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Send the Discord reminder
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DRY_RUN: ${{ inputs.dry_run && '1' || '' }}
+          # Optional: set these under Settings -> Secrets and variables -> Actions -> Variables.
+          MESSAGE_TEMPLATE: ${{ vars.MESSAGE_TEMPLATE }}
+          WEBHOOK_USERNAME: ${{ vars.WEBHOOK_USERNAME }}
+          TIMEZONE: ${{ vars.TIMEZONE }}
+        run: python3 main.py
+
+      - name: Save the day counter
+        if: ${{ !inputs.dry_run }}
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if git diff --cached --quiet; then
+            echo "state.json did not change (already posted today)."
+            exit 0
+          fi
+          git commit -m "chore: advance sock reminder day counter [skip ci]"
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:${BRANCH}"; then
+              echo "Pushed the new day counter."
+              exit 0
+            fi
+            echo "Push failed (attempt ${attempt}), rebasing on origin/${BRANCH}..."
+            git pull --rebase origin "${BRANCH}"
+            sleep 5
+          done
+          echo "Could not push the updated state.json." >&2
+          exit 1
